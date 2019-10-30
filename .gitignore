@@ -1,0 +1,4 @@
+.serverless
+.idea
+node_modules
+.nyc_output

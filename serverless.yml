@@ -1,0 +1,469 @@
+service: notification-service
+
+provider:
+  name: aws
+  runtime: nodejs10.x
+#  Stage can be used to deploy on a different envs
+#  By default should be dev
+  stage: ${opt:stage, 'dev'}
+#  Region can be used to deploy to different regions
+#  in case of global availability. I personally use
+#  us-west-2 cause it's the cheapest region in AWS
+  region: ${opt:region, 'us-west-2'}
+  environment:
+    NODE_ENV: ${env:NODE_ENV}
+#  If we need to secure our service I have two basic ideas:
+#  1) If this is a part of some customer support service and requests will come
+#     from some webpage, which looks like this according to description,
+#     we can have a basic auth using customer support email and password.
+#     In this case we can use AWS Cognito as an auth service.
+#  2) If this will be executed from some other service or script
+#     we can stay with JWT token. We can issue it by ourselves.
+#  We can also use some 3rd party service for auth such as Auth0.
+#  For now I will assume that we have customer support tool and have a basic auth.
+#  Also we will not have any route for registration, cause registration will be
+#  done by some special person who we trust and who is responsible for registration
+#  of new customer support agents.
+    USER_POOL_ID: ${self:custom.userPoolId.${self:provider.stage}}
+    CLIENT_ID: ${self:custom.clientId.${self:provider.stage}}
+#  Referencing offload task queues
+    SMS_QUEUE:
+      Ref: notificationsSMSQueue
+    EMAIL_QUEUE:
+      Ref: notificationsEmailQueue
+
+# We have custom variables for specific stage.
+# Those variables are in AWS SSM by default and are encrypted by AWS KMS
+# for security reasons.
+custom:
+  stages:
+    - dev
+    - staging
+    - production
+  userPoolId:
+    dev: ${ssm:/notification-service/dev/user-pool-id~true}
+    staging: ${ssm:/notification-service/staging/user-pool-id~true}
+    production: ${ssm:/notification-service/production/user-pool-id~true}
+  clientId:
+    dev: ${ssm:/notification-service/dev/client-id~true}
+    staging: ${ssm:/notification-service/staging/client-id~true}
+    production: ${ssm:/notification-service/production/client-id~true}
+
+# All the functions will have a basic 128 memory and 30 second timeout cause this
+# is the cheapest variant, but for production we can optimise this resources for
+# better performance.
+
+# For reducing cols startup time we can create some cron job to trigger every
+# function once in 5 minutes. For now I will not do this, but we can discuss this
+# during face-to-face interview.
+functions:
+#  Auth part
+#  We will have a custom authorizer to ensure auth token access for every request.
+  authorizer:
+    handler: src/auth/authorizer.handler
+    runtime: nodejs10.x
+    memorySize: 128
+
+  signin:
+    handler: src/auth/signin.handler
+    runtime: nodejs10.x
+    memorySize: 128
+    timeout: 30
+    role: cognitoRole
+    events:
+      - http:
+          path: /signin
+          method: post
+          cors:
+            origin: '*'
+            headers:
+              - Content-Type
+              - X-Amz-Date
+              - Authorization
+              - X-Api-Key
+              - X-Amz-Security-Token
+              - X-Amz-User-Agent
+            allowCredentials: true
+# Feature part
+  notify:
+    handler: src/notification/notify.handler
+    runtime: nodejs10.x
+    memorySize: 128
+    timeout: 30
+    role: notificationsDynamoSQSWriteRole
+    events:
+      - http:
+          path: /notification
+          method: post
+          authorizer: authorizer
+          cors:
+            origin: '*'
+            headers:
+              - Content-Type
+              - X-Amz-Date
+              - Authorization
+              - X-Api-Key
+              - X-Amz-Security-Token
+              - X-Amz-User-Agent
+            allowCredentials: true
+
+  processSMSNotifications:
+    handler: src/notification/processSMSNotifications.handler
+    runtime: nodejs10.x
+    memorySize: 128
+    timeout: 30
+    role: notificationsDynamoWriteSMSReadRole
+    events:
+      - sqs:
+          arn: !GetAtt notificationsSMSQueue.Arn
+          batchSize: 1
+
+  processEmailNotifications:
+    handler: src/notification/processEmailNotifications.handler
+    runtime: nodejs10.x
+    memorySize: 128
+    timeout: 30
+    role: notificationsDynamoWriteEmailReadRole
+    events:
+      - sqs:
+          arn: !GetAtt notificationsEmailQueue.Arn
+          batchSize: 1
+# For retrieving we will use customerId.
+  getNotificationsByCustomer:
+    handler: src/notification/getNotificationsByCustomer.handler
+    runtime: nodejs10.x
+    memorySize: 128
+    timeout: 30
+    role: notificationsDynamoReadRole
+    events:
+      - http:
+          path: /notification/{customerId}
+          method: get
+          authorizer: authorizer
+          cors:
+            origin: '*'
+            headers:
+              - Content-Type
+              - X-Amz-Date
+              - Authorization
+              - X-Api-Key
+              - X-Amz-Security-Token
+              - X-Amz-User-Agent
+          allowCredentials: true
+
+# We will separate roles for specific actions cause it's better for security
+resources:
+  Resources:
+    notificationsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: notificationsTable
+        AttributeDefinitions:
+          - AttributeName: notificationId
+            AttributeType: S
+          - AttributeName: customerId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: notificationId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: customerId-index
+            KeySchema:
+              - AttributeName: customerId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        BillingMode: PAY_PER_REQUEST
+
+    notificationsSMSQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: "notifications-sms-queue"
+        MessageRetentionPeriod: 60
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt notificationsSMSDeadLetterQueue.Arn
+          maxReceiveCount: 1
+
+# We will use DLQ to store all failures during queue messages processing
+# Next we can do manual check or any retry strategy based on this.
+    notificationsSMSDeadLetterQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: "notifications-sms-dead-letter-queue"
+        MessageRetentionPeriod: 1209600 # 14 days in seconds
+
+    notificationsEmailQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: "notifications-email-queue"
+        MessageRetentionPeriod: 60
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt notificationsEmailDeadLetterQueue.Arn
+          maxReceiveCount: 1
+
+    notificationsEmailDeadLetterQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: "notifications-email-dead-letter-queue"
+        MessageRetentionPeriod: 1209600
+
+    notificationsDynamoReadRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Path: '/'
+        RoleName: 'Notifications-ReadRole'
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: 'notifications-read-policy'
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - 'Fn::Join':
+                        - ':'
+                        - - 'arn:aws:logs'
+                          - Ref: 'AWS::Region'
+                          - Ref: 'AWS::AccountId'
+                          - 'log-group:/aws/lambda/*:*:*'
+                - Effect: Allow
+                  Action:
+                    - dynamodb:Query
+                  Resource:
+                    - !GetAtt notificationsTable.Arn
+                    - 'Fn::Join':
+                        - '/'
+                        - - !GetAtt notificationsTable.Arn
+                          - 'index/*'
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DetachNetworkInterface
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+
+    notificationsDynamoSQSWriteRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Path: '/'
+        RoleName: 'Notifications-WriteRole'
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: 'notifications-write-policy'
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - 'Fn::Join':
+                        - ':'
+                        - - 'arn:aws:logs'
+                          - Ref: 'AWS::Region'
+                          - Ref: 'AWS::AccountId'
+                          - 'log-group:/aws/lambda/*:*:*'
+                - Effect: Allow
+                  Action:
+                    - dynamodb:PutItem
+                  Resource:
+                    - !GetAtt notificationsTable.Arn
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DetachNetworkInterface
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - sqs:SendMessage
+                  Resource:
+                    - !GetAtt notificationsSMSQueue.Arn
+                    - !GetAtt notificationsEmailQueue.Arn
+
+    notificationsDynamoWriteSMSReadRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Path: '/'
+        RoleName: 'Notifications-WriteSMSReadRole'
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: 'notifications-write-sms-read-policy'
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - 'Fn::Join':
+                        - ':'
+                        - - 'arn:aws:logs'
+                          - Ref: 'AWS::Region'
+                          - Ref: 'AWS::AccountId'
+                          - 'log-group:/aws/lambda/*:*:*'
+                - Effect: Allow
+                  Action:
+                    - dynamodb:PutItem
+                    - dynamodb:Query
+                    - dynamodb:UpdateItem
+                  Resource:
+                    - !GetAtt notificationsTable.Arn
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DetachNetworkInterface
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - sqs:DeleteMessage
+                    - sqs:ChangeMessageVisibility
+                    - sqs:ReceiveMessage
+                    - sqs:GetQueueAttributes
+                  Resource:
+                    - !GetAtt notificationsSMSQueue.Arn
+                - Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: '*'
+
+    notificationsDynamoWriteEmailReadRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Path: '/'
+        RoleName: 'Notifications-WriteEmailReadRole'
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: 'notifications-write-email-read-policy'
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - 'Fn::Join':
+                        - ':'
+                        - - 'arn:aws:logs'
+                          - Ref: 'AWS::Region'
+                          - Ref: 'AWS::AccountId'
+                          - 'log-group:/aws/lambda/*:*:*'
+                - Effect: Allow
+                  Action:
+                    - dynamodb:PutItem
+                    - dynamodb:Query
+                    - dynamodb:UpdateItem
+                  Resource:
+                    - !GetAtt notificationsTable.Arn
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DetachNetworkInterface
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"
+                - Effect: Allow
+                  Action:
+                    - sqs:DeleteMessage
+                    - sqs:ChangeMessageVisibility
+                    - sqs:ReceiveMessage
+                    - sqs:GetQueueAttributes
+                  Resource:
+                    - !GetAtt notificationsEmailQueue.Arn
+                - Effect: Allow
+                  Action:
+                    - ses:SendEmail
+                  Resource: '*'
+
+    cognitoRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Path: '/'
+        RoleName: 'Moneyou-Cognito-Role'
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: 'moneyou-cognito-policy'
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - 'Fn::Join':
+                        - ':'
+                        - - 'arn:aws:logs'
+                          - Ref: 'AWS::Region'
+                          - Ref: 'AWS::AccountId'
+                          - 'log-group:/aws/lambda/*:*:*'
+                - Effect: Allow
+                  Action: '*'
+                  Resource:
+                    - 'Fn::Join':
+                        - ''
+                        - - 'arn:aws:cognito-idp'
+                          - ':'
+                          - Ref: 'AWS::Region'
+                          - ':'
+                          - Ref: 'AWS::AccountId'
+                          - ':'
+                          - 'userpool/'
+                          - ${self:custom.userPoolId.${self:provider.stage}}
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DetachNetworkInterface
+                    - ec2:DeleteNetworkInterface
+                  Resource: "*"

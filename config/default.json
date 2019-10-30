@@ -1,0 +1,10 @@
+{
+  "aws" : {
+    "dynamodb" : {
+      "notifications" : {
+        "table" : "notificationsTable",
+        "customerIdIndex" : "customerId-index"
+      }
+    }
+  }
+}
