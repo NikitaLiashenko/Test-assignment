@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "NODE_ENV=test mocha --recursive ./test",
-    "coverage": "./node_modules/nyc/bin/nyc.js npm test"
+    "coverage": "./node_modules/nyc/bin/nyc.js npm test",
+    "deploy": "serverless deploy -v"
   },
   "keywords": [],
   "author": "Nikita Liashenko <neiket@hotmail.com>",
@@ -25,6 +26,7 @@
     "chai-as-promised": "^7.1.1",
     "mocha": "^6.2.2",
     "proxyquire": "^2.1.3",
+    "serverless": "^1.55.1",
     "sinon": "^7.5.0",
     "sinon-chai": "^3.3.0"
   }
